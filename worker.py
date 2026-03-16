@@ -294,17 +294,44 @@ def _compute_model_hashes(workflow: dict) -> dict:
     return result
 
 
+MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pth", ".pt", ".bin")
+
+
+def _scan_all_model_refs(workflow: dict) -> list[str]:
+    """Scan workflow for any input value that looks like a model filename.
+
+    Instead of hardcoding loader class_types, checks every node input
+    whose field name ends with '_name' and value ends with a model
+    extension. This catches standard loaders, custom node loaders
+    (UnetLoaderGGUF, DualCLIPLoader, etc.), and future loaders.
+    """
+    filenames = []
+    seen = set()
+    for _node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        for field, value in inputs.items():
+            if not isinstance(value, str):
+                continue
+            if not field.endswith("_name"):
+                continue
+            if not value.lower().endswith(MODEL_EXTENSIONS):
+                continue
+            if value not in seen:
+                seen.add(value)
+                filenames.append(value)
+    return filenames
+
+
 def _check_models_exist(workflow: dict) -> list[str]:
     """Check that all model files referenced in the workflow exist on disk.
 
     Returns list of missing filenames. Empty list means all models found.
     """
-    refs = _extract_model_refs(workflow)
+    filenames = _scan_all_model_refs(workflow)
     missing = []
-    for ref in refs:
-        filename = ref["filename"]
-        if filename in missing:
-            continue
+    for filename in filenames:
         if _resolve_model_path(filename) is None:
             missing.append(filename)
     return missing
