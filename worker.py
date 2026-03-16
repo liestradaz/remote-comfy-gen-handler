@@ -310,6 +310,57 @@ def _check_models_exist(workflow: dict) -> list[str]:
     return missing
 
 
+# --- Error formatting ---
+
+def _clean_error(error_msg: str) -> str:
+    """Parse ComfyUI error strings into clean, human-readable messages."""
+    # Try to find a ComfyUI JSON error payload in the string
+    json_start = error_msg.find('{"error"')
+    if json_start == -1:
+        # No ComfyUI JSON — return as-is but strip traceback noise
+        if "Job failed after" in error_msg:
+            # Strip the "Job failed after Ns: " prefix if re-wrapped
+            parts = error_msg.split(": ", 1)
+            if len(parts) > 1:
+                return parts[1]
+        return error_msg
+
+    try:
+        comfy_err = json.loads(error_msg[json_start:])
+    except (json.JSONDecodeError, ValueError):
+        return error_msg.split("\n")[0]
+
+    err_type = comfy_err.get("error", {}).get("type", "")
+    err_msg = comfy_err.get("error", {}).get("message", "")
+    extra = comfy_err.get("error", {}).get("extra_info", {})
+    node_errors = comfy_err.get("node_errors", {})
+
+    # Missing custom node
+    if err_type == "missing_node_type":
+        node_title = extra.get("node_title", "")
+        class_type = extra.get("class_type", "")
+        return (
+            f"Missing custom node: {node_title or class_type}. "
+            f"The auto-installer could not find or install this node."
+        )
+
+    # Validation errors (missing models, wrong values, etc.)
+    if err_type == "prompt_outputs_failed_validation" and node_errors:
+        lines = ["Workflow validation failed:"]
+        for node_id, info in node_errors.items():
+            class_type = info.get("class_type", "unknown")
+            for e in info.get("errors", []):
+                detail = e.get("details", e.get("message", "unknown error"))
+                lines.append(f"  Node {node_id} ({class_type}): {detail}")
+        return "\n".join(lines)
+
+    # Generic ComfyUI error
+    if err_msg:
+        return f"ComfyUI error: {err_msg}"
+
+    return error_msg.split("\n")[0]
+
+
 # --- Progress helper ---
 
 def _send_progress(job: dict, stage: str, message: str, percent: float = 0, **extra) -> None:
@@ -608,27 +659,10 @@ def handler(job: dict) -> dict:
     except Exception as e:
         elapsed = int(time.time() - start_time)
         print(f"@@JOB_END {job_id}", flush=True)
-        error_msg = str(e)
-
-        # Parse ComfyUI-specific errors into clean messages
-        if "missing_node_type" in error_msg:
-            # Extract the readable part from ComfyUI's error JSON
-            try:
-                # Find the JSON payload in the error string
-                json_start = error_msg.find('{"error"')
-                if json_start != -1:
-                    comfy_err = json.loads(error_msg[json_start:])
-                    node_title = comfy_err["error"]["extra_info"].get("node_title", "")
-                    class_type = comfy_err["error"]["extra_info"].get("class_type", "")
-                    error_msg = (
-                        f"Missing custom node: {node_title or class_type}. "
-                        f"The auto-installer could not find or install this node."
-                    )
-            except (json.JSONDecodeError, KeyError):
-                pass
-
+        error_msg = _clean_error(str(e))
         print(f"[job {job_id[:8]}] FAILED after {elapsed}s: {error_msg}", flush=True)
-        return {"ok": False, "error": error_msg, "elapsed_seconds": elapsed}
+        # Raise so RunPod SDK marks the job as FAILED (not stuck IN_PROGRESS)
+        raise RuntimeError(error_msg) from None
 
     finally:
         # --- Cleanup temp files ---
