@@ -337,8 +337,30 @@ def _get_manager_model_list() -> dict[str, dict]:
 
     Returns {filename: {url, save_path, name}} or empty dict on failure.
     """
+    # Try reading model-list.json directly from disk (no ComfyUI API needed)
+    model_list_path = "/ComfyUI/custom_nodes/ComfyUI-Manager/model-list.json"
     try:
-        url = f"http://{os.environ.get('COMFY_HOST', '127.0.0.1:8188')}/externalmodel/getlist?mode=cache"
+        with open(model_list_path) as f:
+            data = json.load(f)
+        models = data.get("models", []) if isinstance(data, dict) else data
+        result = {}
+        for m in models:
+            fn = m.get("filename", "")
+            if fn:
+                result[fn] = {
+                    "url": m.get("url", ""),
+                    "save_path": m.get("save_path", ""),
+                    "name": m.get("name", ""),
+                }
+        print(f"[worker] Loaded {len(result)} models from Manager model list", flush=True)
+        return result
+    except Exception as e:
+        print(f"[worker] Failed to load Manager model list: {e}", flush=True)
+
+    # Fallback: try the API endpoint
+    try:
+        host = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
+        url = f"http://{host}/externalmodel/getlist?mode=cache"
         with urllib.request.urlopen(url, timeout=10) as r:
             data = json.loads(r.read())
         return {
@@ -350,7 +372,8 @@ def _get_manager_model_list() -> dict[str, dict]:
             for m in data.get("models", [])
             if m.get("filename")
         }
-    except Exception:
+    except Exception as e:
+        print(f"[worker] Failed to fetch Manager model list via API: {e}", flush=True)
         return {}
 
 
