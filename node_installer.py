@@ -1,15 +1,18 @@
 """Auto-detect and install missing ComfyUI custom nodes from workflow JSON.
 
-Uses ComfyUI-Manager's extension-node-map to resolve class_type → git repo.
-Caches the map at /runpod-volume/.node-map-cache.json for fast lookups.
+Uses ComfyUI-Manager's API to resolve class_type → git repo. The Manager
+applies preemption rules and we additionally rank by star count to pick
+the correct repo when multiple claim the same node.
 
 Flow:
     1. Extract all class_type values from workflow
     2. Query ComfyUI /object_info for installed node types
     3. Diff → missing class_types
-    4. Look up repos in extension-node-map
-    5. git clone + pip install deps
-    6. Restart ComfyUI
+    4. Query ComfyUI-Manager /customnode/getmappings for node→repo map
+    5. Query ComfyUI-Manager /customnode/getlist for repo star counts
+    6. For each missing node, pick the repo with the most stars
+    7. git clone + pip install deps
+    8. Restart ComfyUI
 """
 
 import json
@@ -25,9 +28,11 @@ COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_URL = f"http://{COMFY_HOST}"
 COMFYUI_DIR = os.environ.get("COMFYUI_DIR", "/ComfyUI")
 CUSTOM_NODES_DIR = os.path.join(COMFYUI_DIR, "custom_nodes")
+
+# Fallback: raw GitHub map used when ComfyUI-Manager is not available
 NODE_MAP_CACHE = "/runpod-volume/.node-map-cache.json"
 NODE_MAP_URL = "https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/extension-node-map.json"
-NODE_MAP_MAX_AGE = 86400  # refresh cache after 24h
+NODE_MAP_MAX_AGE = 3600  # refresh cache after 1h
 
 
 def extract_class_types(workflow: dict) -> set[str]:
@@ -50,16 +55,54 @@ def get_installed_node_types() -> set[str]:
         return set()
 
 
-def get_node_map() -> dict:
-    """Load extension-node-map, using cache if fresh enough."""
-    # Try cache first
+def _get_manager_mappings() -> dict | None:
+    """Fetch node mappings from ComfyUI-Manager with preemptions applied.
+
+    Returns the mappings dict or None if Manager is not available.
+    """
+    try:
+        url = f"{COMFY_URL}/customnode/getmappings?mode=nickname"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        print(f"[node_installer] ComfyUI-Manager not available: {e}", flush=True)
+        return None
+
+
+def _get_manager_pack_stars() -> dict[str, int]:
+    """Fetch star counts for all node packs from ComfyUI-Manager.
+
+    Returns {pack_id_or_url: star_count}.
+    """
+    try:
+        url = f"{COMFY_URL}/customnode/getlist?mode=local&skip_update=true"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        print(f"[node_installer] Could not fetch pack list: {e}", flush=True)
+        return {}
+
+    stars = {}
+    for pid, info in data.get("node_packs", {}).items():
+        s = info.get("stars", 0) or 0
+        stars[pid] = s
+        repo = info.get("repository", "")
+        if repo:
+            stars[repo] = s
+    return stars
+
+
+def _get_fallback_node_map() -> dict:
+    """Fetch raw extension-node-map from GitHub (no preemptions).
+
+    Used only when ComfyUI-Manager is not installed/running.
+    """
     if os.path.exists(NODE_MAP_CACHE):
         age = time.time() - os.path.getmtime(NODE_MAP_CACHE)
         if age < NODE_MAP_MAX_AGE:
             with open(NODE_MAP_CACHE) as f:
                 return json.load(f)
 
-    # Fetch from GitHub
     print("[node_installer] Fetching extension-node-map from GitHub...", flush=True)
     try:
         with urllib.request.urlopen(NODE_MAP_URL, timeout=15) as r:
@@ -71,29 +114,89 @@ def get_node_map() -> dict:
         return data
     except Exception as e:
         print(f"[node_installer] WARNING: Could not fetch node map: {e}", flush=True)
-        # Fall back to stale cache if available
         if os.path.exists(NODE_MAP_CACHE):
             with open(NODE_MAP_CACHE) as f:
                 return json.load(f)
         return {}
 
 
-def resolve_repos(missing_types: set[str], node_map: dict) -> dict[str, list[str]]:
-    """Map missing class_types to git repo URLs.
+def _build_node_to_repo(mappings: dict, pack_stars: dict) -> dict[str, str]:
+    """Build a class_type → repo lookup, picking the most popular repo on conflict.
 
-    Returns {repo_url: [class_type, ...]} for repos that need installing.
+    Args:
+        mappings: {repo_id_or_url: [[class_types...], {metadata}]}
+        pack_stars: {repo_id_or_url: star_count}
+
+    Returns:
+        {class_type: repo_url_or_id}
     """
-    # node_map format: {"repo_url": [["class_type1", "class_type2", ...], {...}]}
-    # The first element is a list of class_types provided by that repo.
-    repos = {}
-    for repo_url, info in node_map.items():
+    # Collect all repos that claim each node
+    node_candidates = {}
+    for repo, info in mappings.items():
         if not isinstance(info, list) or len(info) == 0:
             continue
-        provided_types = info[0] if isinstance(info[0], list) else []
-        matched = missing_types & set(provided_types)
-        if matched:
-            repos[repo_url] = list(matched)
+        nodes = info[0] if isinstance(info[0], list) else []
+        for n in nodes:
+            node_candidates.setdefault(n, []).append(repo)
+
+    # For each node, pick the repo with the most stars
+    node_to_repo = {}
+    for node, repos in node_candidates.items():
+        if len(repos) == 1:
+            node_to_repo[node] = repos[0]
+        else:
+            best = max(repos, key=lambda r: pack_stars.get(r, 0))
+            node_to_repo[node] = best
+
+    return node_to_repo
+
+
+def resolve_repos(missing_types: set[str], node_to_repo: dict) -> dict[str, list[str]]:
+    """Map missing class_types to git repo URLs/IDs.
+
+    Returns {repo: [class_type, ...]} for repos that need installing.
+    """
+    repos = {}
+    for ct in missing_types:
+        repo = node_to_repo.get(ct)
+        if repo:
+            repos.setdefault(repo, []).append(ct)
     return repos
+
+
+def _resolve_repo_url(repo_id: str, mappings: dict) -> str:
+    """Resolve a ComfyRegistry ID to a git URL for cloning.
+
+    Manager mappings use CNR IDs (e.g. 'comfyui-videohelpersuite') as keys
+    instead of full URLs. We need to find the git URL for cloning.
+    """
+    if repo_id.startswith("http"):
+        return repo_id
+
+    # Check if the mapping metadata has install info
+    info = mappings.get(repo_id, [])
+    if len(info) > 1 and isinstance(info[1], dict):
+        # Some entries have 'title_aux' with the repo name
+        title = info[1].get("title_aux", "")
+        if title:
+            # Try common GitHub URL pattern
+            url = f"https://github.com/search?q={repo_id}"
+
+    # Try fetching pack info from Manager for the git URL
+    try:
+        url = f"{COMFY_URL}/customnode/getlist?mode=local&skip_update=true"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read())
+        pack = data.get("node_packs", {}).get(repo_id, {})
+        git_url = pack.get("repository", "")
+        if git_url:
+            return git_url
+    except Exception:
+        pass
+
+    # Last resort: assume GitHub with the ID as repo name
+    print(f"[node_installer] WARNING: Could not resolve git URL for '{repo_id}', skipping", flush=True)
+    return ""
 
 
 def install_repo(repo_url: str, force_deps: bool = False) -> bool:
@@ -104,6 +207,9 @@ def install_repo(repo_url: str, force_deps: bool = False) -> bool:
         force_deps: If True, reinstall deps even if repo dir already exists.
                     Used when the repo exists but its nodes failed to import.
     """
+    if not repo_url:
+        return False
+
     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     target = os.path.join(CUSTOM_NODES_DIR, repo_name)
 
@@ -204,9 +310,11 @@ def parse_missing_node_from_error(error_msg: str) -> str | None:
 def ensure_nodes(workflow: dict, max_retries: int = 3) -> list[str]:
     """Check workflow for missing nodes and install them.
 
+    Resolution strategy:
+    1. Try ComfyUI-Manager API (preemptions + star-count ranking)
+    2. Fall back to raw GitHub extension-node-map if Manager unavailable
+
     Returns list of newly installed repo names.
-    Can be called before queue_prompt as a pre-check,
-    or after a failure to handle warm-worker missing nodes.
     """
     installed_types = get_installed_node_types()
     required_types = extract_class_types(workflow)
@@ -217,14 +325,46 @@ def ensure_nodes(workflow: dict, max_retries: int = 3) -> list[str]:
 
     print(f"[node_installer] Missing node types: {missing}", flush=True)
 
-    node_map = get_node_map()
-    repos = resolve_repos(missing, node_map)
+    # Try ComfyUI-Manager API first (preemptions applied, star ranking)
+    mappings = _get_manager_mappings()
+    if mappings:
+        pack_stars = _get_manager_pack_stars()
+        node_to_repo = _build_node_to_repo(mappings, pack_stars)
+        repos = resolve_repos(missing, node_to_repo)
+
+        # Resolve CNR IDs to git URLs
+        resolved_repos = {}
+        for repo_id, types in repos.items():
+            git_url = _resolve_repo_url(repo_id, mappings)
+            if git_url:
+                resolved_repos[git_url] = types
+        repos = resolved_repos
+    else:
+        # Fallback: raw extension-node-map (no preemptions, no star ranking)
+        print("[node_installer] Falling back to raw extension-node-map", flush=True)
+        raw_map = _get_fallback_node_map()
+        node_to_repo = {}
+        for repo_url, info in raw_map.items():
+            if not isinstance(info, list) or len(info) == 0:
+                continue
+            nodes = info[0] if isinstance(info[0], list) else []
+            for n in nodes:
+                if n not in node_to_repo:
+                    node_to_repo[n] = repo_url
+        repos = resolve_repos(missing, node_to_repo)
 
     if not repos:
-        unresolved = missing - {t for types in repos.values() for t in types}
+        resolved_types = set(node_to_repo.keys())
+        unresolved = missing - resolved_types
         if unresolved:
             print(f"[node_installer] WARNING: Could not resolve repos for: {unresolved}", flush=True)
         return []
+
+    # Report unresolved types
+    resolved_in_repos = {t for types in repos.values() for t in types}
+    unresolved = missing - resolved_in_repos
+    if unresolved:
+        print(f"[node_installer] WARNING: Could not resolve repos for: {unresolved}", flush=True)
 
     # Install all missing repos (force deps if dir exists but nodes aren't loaded)
     installed_repos = []
@@ -232,7 +372,7 @@ def ensure_nodes(workflow: dict, max_retries: int = 3) -> list[str]:
         repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
         target = os.path.join(CUSTOM_NODES_DIR, repo_name)
         dir_exists = os.path.exists(target)
-        print(f"[node_installer] {repo_url} provides: {types}", flush=True)
+        print(f"[node_installer] {repo_name} provides: {types}", flush=True)
         if install_repo(repo_url, force_deps=dir_exists):
             installed_repos.append(repo_name)
 
