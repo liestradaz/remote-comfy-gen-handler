@@ -343,13 +343,34 @@ def _get_manager_model_list() -> dict[str, dict]:
         with open(model_list_path) as f:
             data = json.load(f)
         models = data.get("models", []) if isinstance(data, dict) else data
+        # Map Manager's "type" field to ComfyUI model subfolder
+        # Used when save_path is "default"
+        TYPE_TO_FOLDER = {
+            "checkpoint": "checkpoints",
+            "clip": "clip",
+            "clip_vision": "clip_vision",
+            "controlnet": "controlnet",
+            "diffusion_model": "diffusion_models",
+            "embeddings": "embeddings",
+            "lora": "loras",
+            "upscale": "upscale_models",
+            "vae": "vae",
+            "text_encoder": "text_encoders",
+        }
+
         result = {}
         for m in models:
             fn = m.get("filename", "")
             if fn:
+                save_path = m.get("save_path", "")
+                model_type = m.get("type", "")
+                # Resolve "default" save_path using model type
+                if save_path == "default" and model_type:
+                    save_path = TYPE_TO_FOLDER.get(model_type.lower(), save_path)
                 result[fn] = {
                     "url": m.get("url", ""),
-                    "save_path": m.get("save_path", ""),
+                    "save_path": save_path,
+                    "type": model_type,
                     "name": m.get("name", ""),
                 }
         print(f"[worker] Loaded {len(result)} models from Manager model list", flush=True)
@@ -414,6 +435,7 @@ def _check_models_exist(workflow: dict) -> list[dict]:
         if dl_info:
             entry["download_url"] = dl_info["url"]
             entry["save_path"] = dl_info["save_path"]
+            entry["model_type"] = dl_info.get("type", "")
 
         missing.append(entry)
 
