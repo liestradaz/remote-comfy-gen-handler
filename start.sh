@@ -43,9 +43,10 @@ cd "$COMFYUI_DIR"
 # Experimental performance flags (enable via EXPERIMENTAL=true env var)
 PERF_FLAGS=""
 if [ "${EXPERIMENTAL:-}" = "true" ]; then
-    echo "[start] Experimental mode: enabling cublas_ops, flash-attention, gpu-only"
+    echo "[start] Experimental mode: enabling cublas_ops, flash-attention"
     # NOTE: fp8_matrix_mult causes corrupted output with Qwen Image models (ComfyUI #9190)
-    PERF_FLAGS="--fast cublas_ops --gpu-only --use-flash-attention"
+    # NOTE: --gpu-only removed — causes OOM on large workflows
+    PERF_FLAGS="--fast cublas_ops --use-flash-attention"
 fi
 
 python3 main.py \
