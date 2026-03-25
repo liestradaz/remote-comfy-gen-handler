@@ -22,6 +22,60 @@ import node_installer
 import storage
 
 
+# --- Model hash cache (persisted on network volume) ---
+_HASH_CACHE_PATH = "/runpod-volume/.model-hash-cache.json"
+_hash_cache: dict[str, dict] = {}  # {path: {sha256, size, mtime}}
+_hash_cache_lock = threading.Lock()
+
+
+def _load_hash_cache() -> None:
+    """Load the hash cache from disk into memory."""
+    global _hash_cache
+    try:
+        with open(_HASH_CACHE_PATH, "r") as f:
+            _hash_cache = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        _hash_cache = {}
+
+
+def _save_hash_cache() -> None:
+    """Persist the hash cache to disk atomically."""
+    tmp = _HASH_CACHE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(_hash_cache, f)
+        os.replace(tmp, _HASH_CACHE_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _cached_sha256(path: str) -> str:
+    """Return SHA256 for a model file, using cache when size+mtime match."""
+    st = os.stat(path)
+    size = st.st_size
+    mtime = st.st_mtime
+
+    with _hash_cache_lock:
+        entry = _hash_cache.get(path)
+        if entry and entry.get("size") == size and entry.get("mtime") == mtime:
+            return entry["sha256"]
+
+    sha = _sha256_file(path)
+
+    with _hash_cache_lock:
+        _hash_cache[path] = {"sha256": sha, "size": size, "mtime": mtime}
+        _save_hash_cache()
+
+    return sha
+
+
+# Load cache at module import time
+_load_hash_cache()
+
+
 # --- Model hash helpers ---
 
 MODEL_DIRS = [
@@ -247,7 +301,7 @@ def _compute_model_hashes(workflow: dict) -> dict:
             continue
 
         try:
-            sha = _sha256_file(path)
+            sha = _cached_sha256(path)
             entry = {
                 "sha256": sha,
                 "type": _model_type_from_path(path),
@@ -742,7 +796,7 @@ def handler(job: dict) -> dict:
             print(f"[job {job_id[:8]}] Uploaded video: {vid['filename']} ({vid['size_bytes']:,} bytes)")
 
         # --- Wait for model hashes (should be done by now) ---
-        hash_thread.join(timeout=30)
+        hash_thread.join()
 
         elapsed = int(time.time() - start_time)
 
@@ -770,8 +824,7 @@ def handler(job: dict) -> dict:
             if dims:
                 output["resolution"] = dims
 
-        if hash_result:
-            output["model_hashes"] = hash_result
+        output["model_hashes"] = hash_result
 
         # See sleep comment in except block — same race condition applies
         time.sleep(1)
