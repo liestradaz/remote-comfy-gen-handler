@@ -20,6 +20,7 @@ import runpod
 import comfy_client
 import node_installer
 import storage
+from log_forwarder import log
 
 
 # --- Model hash cache (persisted on network volume) ---
@@ -402,10 +403,10 @@ def _get_manager_model_list() -> dict[str, dict]:
                     "type": model_type,
                     "name": m.get("name", ""),
                 }
-        print(f"[worker] Loaded {len(result)} models from Manager model list", flush=True)
+        log.info(f"Loaded {len(result)} models from Manager model list")
         return result
     except Exception as e:
-        print(f"[worker] Failed to load Manager model list: {e}", flush=True)
+        log.warn(f"Failed to load Manager model list: {e}")
 
     # Fallback: try the API endpoint
     try:
@@ -423,7 +424,7 @@ def _get_manager_model_list() -> dict[str, dict]:
             if m.get("filename")
         }
     except Exception as e:
-        print(f"[worker] Failed to fetch Manager model list via API: {e}", flush=True)
+        log.warn(f"Failed to fetch Manager model list via API: {e}")
         return {}
 
 
@@ -588,7 +589,8 @@ def handler(job: dict) -> dict:
 
     start_time = time.time()
     job_id = job.get("id", "unknown")
-    print(f"@@JOB_START {job_id}", flush=True)
+    jlog = log.with_tags(job_id=job_id)
+    jlog.info(f"@@JOB_START {job_id}")
 
     workflow = job_input["workflow"]
     file_inputs = job_input.get("file_inputs", {})
@@ -613,7 +615,7 @@ def handler(job: dict) -> dict:
             field = file_info["field"]
             local_path = os.path.join(input_dir, filename)
 
-            print(f"[job {job_id[:8]}] Downloading input: {filename}")
+            jlog.info(f"Downloading input: {filename}")
             storage.download(url, local_path)
 
             # Upload to ComfyUI's input directory
@@ -640,7 +642,7 @@ def handler(job: dict) -> dict:
         missing_models = _check_models_exist(workflow)
         if missing_models:
             names = ", ".join(m["filename"] for m in missing_models)
-            print(f"[job {job_id[:8]}] Missing models: {names}", flush=True)
+            jlog.error(f"Missing models: {names}")
             downloadable = [m for m in missing_models if "download_url" in m]
             time.sleep(1)  # Race condition fix (issue #250)
             return {
@@ -661,22 +663,22 @@ def handler(job: dict) -> dict:
 
         installed = node_installer.ensure_nodes(workflow, progress_fn=_node_progress)
         if installed:
-            print(f"[job {job_id[:8]}] Installed custom nodes: {installed}")
+            jlog.info(f"Installed custom nodes: {installed}")
 
-        print(f"[job {job_id[:8]}] Queuing prompt...")
+        jlog.info("Queuing prompt...")
         _send_progress(job, "queue", "Queuing prompt", percent=15)
         try:
             prompt_id, client_id = comfy_client.queue_prompt(workflow)
         except RuntimeError as e:
             missing_node = node_installer.parse_missing_node_from_error(str(e))
             if missing_node:
-                print(f"[job {job_id[:8]}] ComfyUI rejected: missing {missing_node}. Attempting install...")
+                jlog.warn(f"ComfyUI rejected: missing {missing_node}. Attempting install...")
                 _send_progress(job, "node_check", f"Installing missing node: {missing_node}", percent=11)
                 node_installer.ensure_nodes(workflow, max_retries=1, progress_fn=_node_progress)
                 prompt_id, client_id = comfy_client.queue_prompt(workflow)
             else:
                 raise
-        print(f"[job {job_id[:8]}] Prompt ID: {prompt_id}")
+        jlog.info(f"Prompt ID: {prompt_id}")
 
         # --- Step 4: Wait for completion with progress ---
         def _node_class(node_id: str) -> str:
@@ -726,7 +728,7 @@ def handler(job: dict) -> dict:
 
             _send_progress(job, stage, msg, percent=pct, **extra)
             prefix = f"({completed}/{total}) " if total > 0 and completed > 0 else ""
-            print(f"[job {job_id[:8]}] {stage}: {prefix}{msg}", flush=True)
+            jlog.info(f"{stage}: {prefix}{msg}")
 
         history = comfy_client.poll_completion(
             prompt_id,
@@ -738,18 +740,18 @@ def handler(job: dict) -> dict:
 
         # --- Step 5: Collect outputs ---
         _send_progress(job, "collecting", "Collecting outputs", percent=90)
-        print(f"[job {job_id[:8]}] History outputs: {json.dumps({k: list(v.keys()) for k, v in history.get('outputs', {}).items()})}")
+        jlog.info(f"History outputs: {json.dumps({k: list(v.keys()) for k, v in history.get('outputs', {}).items()})}")
         results = comfy_client.collect_outputs(history, output_dir)
-        print(f"[job {job_id[:8]}] Collected: {len(results['images'])} images, {len(results['videos'])} videos")
+        jlog.info(f"Collected: {len(results['images'])} images, {len(results['videos'])} videos")
 
         # --- Check for empty outputs / partial execution ---
         if not results["images"] and not results["videos"]:
             # Dump full history for debugging
             status = history.get("status", {})
             status_messages = status.get("messages", [])
-            print(f"[job {job_id[:8]}] WARNING: No outputs collected!", flush=True)
-            print(f"[job {job_id[:8]}] History status: {json.dumps(status, indent=2)}", flush=True)
-            print(f"[job {job_id[:8]}] Full history outputs: {json.dumps(history.get('outputs', {}), indent=2)}", flush=True)
+            jlog.warn("No outputs collected!")
+            jlog.warn(f"History status: {json.dumps(status, indent=2)}")
+            jlog.warn(f"Full history outputs: {json.dumps(history.get('outputs', {}), indent=2)}")
 
             # Check for execution errors in status messages
             errors = [
@@ -763,9 +765,9 @@ def handler(job: dict) -> dict:
                 exc_type = err_detail.get("exception_type", "")
                 traceback_lines = err_detail.get("traceback", [])
                 traceback_str = "\n".join(traceback_lines) if traceback_lines else ""
-                print(f"[job {job_id[:8]}] Execution error in node {node_id} ({exc_type}): {exc_msg}", flush=True)
+                jlog.error(f"Execution error in node {node_id} ({exc_type}): {exc_msg}")
                 if traceback_str:
-                    print(f"[job {job_id[:8]}] Traceback:\n{traceback_str}", flush=True)
+                    jlog.error(f"Traceback:\n{traceback_str}")
                 raise RuntimeError(
                     f"Execution error in node {node_id} ({exc_type}): {exc_msg}"
                 )
@@ -786,21 +788,21 @@ def handler(job: dict) -> dict:
             img["size_bytes"] = os.path.getsize(img["path"])
             url = storage.upload(img["path"])
             output_images.append({"url": url, "size_bytes": img["size_bytes"]})
-            print(f"[job {job_id[:8]}] Uploaded image: {img['filename']} ({img['size_bytes']:,} bytes)")
+            jlog.info(f"Uploaded image: {img['filename']} ({img['size_bytes']:,} bytes)")
 
         for vid in results["videos"]:
             _strip_metadata(vid["path"])
             vid["size_bytes"] = os.path.getsize(vid["path"])
             url = storage.upload(vid["path"])
             output_videos.append({"url": url, "size_bytes": vid["size_bytes"]})
-            print(f"[job {job_id[:8]}] Uploaded video: {vid['filename']} ({vid['size_bytes']:,} bytes)")
+            jlog.info(f"Uploaded video: {vid['filename']} ({vid['size_bytes']:,} bytes)")
 
         # --- Wait for model hashes (should be done by now) ---
         hash_thread.join()
 
         elapsed = int(time.time() - start_time)
 
-        print(f"@@JOB_END {job_id}", flush=True)
+        jlog.info(f"@@JOB_END {job_id}")
 
         # --- Build output in standard convention ---
         # Primary output: prefer video, fall back to image
@@ -832,9 +834,9 @@ def handler(job: dict) -> dict:
 
     except Exception as e:
         elapsed = int(time.time() - start_time)
-        print(f"@@JOB_END {job_id}", flush=True)
+        jlog.error(f"@@JOB_END {job_id}")
         error_msg = _clean_error(str(e))
-        print(f"[job {job_id[:8]}] FAILED after {elapsed}s: {error_msg}", flush=True)
+        jlog.error(f"FAILED after {elapsed}s: {error_msg}")
         # Race condition: RunPod SDK sends progress_update async. If we return
         # too quickly, the progress POST arrives after the result POST and
         # overwrites the status back to IN_PROGRESS. sleep(1) gives the
@@ -844,6 +846,8 @@ def handler(job: dict) -> dict:
         return {"ok": False, "error_message": error_msg}
 
     finally:
+        # Flush logs before cleanup so all job lines are sent
+        jlog.flush()
         # --- Cleanup temp files ---
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

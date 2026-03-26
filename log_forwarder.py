@@ -1,16 +1,16 @@
-#!/usr/bin/env python3
-"""Reads stdin line-by-line, echoes to stdout, and batches+forwards to a remote log receiver.
+"""Buffered logger that forwards logs to avivs_logger service.
 
-Used on RunPod workers to forward logs to a local machine via Cloudflare tunnel.
+Sends structured logs with source, tags, and levels to
+https://logging.avivkaplan.com/ingest. Buffers lines and flushes
+periodically to reduce HTTP overhead.
 
-Usage (in start.sh):
-    exec torchrun ... 2>&1 | python log_forwarder.py
+Also prints all lines to stderr so they appear in RunPod's built-in logs.
 
 Environment variables:
-    LOG_RECEIVER_URL   - Full URL of log receiver (e.g. https://xxx.trycloudflare.com)
-    LOG_RECEIVER_TOKEN - Bearer token for auth
-    RUNPOD_ENDPOINT_ID - RunPod endpoint ID (for log grouping)
-    RUNPOD_POD_ID      - RunPod pod/worker ID (for log grouping)
+    AVIVS_LOGGER_TOKEN  - Bearer token for auth (required for forwarding)
+    AVIVS_LOGGER_URL    - Override endpoint (default: https://logging.avivkaplan.com)
+    RUNPOD_ENDPOINT_ID  - Used as tag
+    RUNPOD_POD_ID       - Used as tag (worker_id)
 """
 from __future__ import annotations
 
@@ -18,94 +18,103 @@ import json
 import os
 import sys
 import threading
-import time
 import urllib.request
-import urllib.error
 
-URL = os.environ.get("LOG_RECEIVER_URL", "").rstrip("/")
-TOKEN = os.environ.get("LOG_RECEIVER_TOKEN", "")
-ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", os.environ.get("RUNPOD_DC_ID", "unknown"))
-WORKER_ID = os.environ.get("RUNPOD_POD_ID", os.environ.get("HOSTNAME", "unknown"))
+_LOGGER_URL = os.environ.get("AVIVS_LOGGER_URL", os.environ.get("LOG_RECEIVER_URL", "https://logging.avivkaplan.com"))
+_LOGGER_TOKEN = os.environ.get("AVIVS_LOGGER_TOKEN", os.environ.get("LOG_RECEIVER_TOKEN", ""))
 
-BATCH_SIZE = 50
-FLUSH_INTERVAL = 2.0  # seconds
-
-_buffer: list[str] = []
-_lock = threading.Lock()
-_stop = threading.Event()
+SOURCE = "comfy-gen-worker"
 
 
-def _flush():
-    """Send buffered lines to the receiver."""
-    with _lock:
-        if not _buffer:
+class AvivLogger:
+    def __init__(self, source: str = SOURCE, tags: dict[str, str] | None = None,
+                 flush_interval: float = 5.0):
+        self.source = source
+        self.tags = tags or {}
+        self._url = _LOGGER_URL.rstrip("/") + "/ingest"
+        self._token = _LOGGER_TOKEN
+        self._enabled = bool(self._token)
+        self._buffer: list[tuple[str, str]] = []  # (level, line)
+        self._lock = threading.Lock()
+        self._flush_interval = flush_interval
+        self._timer: threading.Timer | None = None
+        if self._enabled:
+            self._schedule_flush()
+
+    def _schedule_flush(self) -> None:
+        self._timer = threading.Timer(self._flush_interval, self._auto_flush)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _auto_flush(self) -> None:
+        self.flush()
+        self._schedule_flush()
+
+    def info(self, line: str, **extra_tags: str) -> None:
+        self._append("INFO", line, extra_tags)
+
+    def warn(self, line: str, **extra_tags: str) -> None:
+        self._append("WARN", line, extra_tags)
+
+    def error(self, line: str, **extra_tags: str) -> None:
+        self._append("ERROR", line, extra_tags)
+
+    def _append(self, level: str, line: str, extra_tags: dict[str, str] | None = None) -> None:
+        # Always print to stderr for RunPod's built-in log viewer
+        print(line, file=sys.stderr, flush=True)
+        if not self._enabled:
             return
-        lines = _buffer.copy()
-        _buffer.clear()
+        with self._lock:
+            self._buffer.append((level, line))
 
-    payload = json.dumps({
-        "endpoint_id": ENDPOINT_ID,
-        "worker_id": WORKER_ID,
-        "lines": lines,
-    }).encode()
+    def flush(self) -> None:
+        with self._lock:
+            if not self._buffer:
+                return
+            batches: dict[str, list[str]] = {}
+            for level, line in self._buffer:
+                batches.setdefault(level, []).append(line)
+            self._buffer.clear()
 
-    req = urllib.request.Request(
-        URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {TOKEN}",
-            "User-Agent": "runpod-log-forwarder/1.0",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            resp.read()
-    except Exception as e:
-        # Log to stderr so it shows in RunPod logs but doesn't crash the worker
-        print(f"[log-forwarder] flush error: {e}", file=sys.stderr, flush=True)
+        for level, lines in batches.items():
+            payload = json.dumps({
+                "source": self.source,
+                "tags": self.tags,
+                "level": level,
+                "lines": lines,
+            }).encode()
+            req = urllib.request.Request(
+                self._url,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._token}",
+                },
+            )
+            try:
+                urllib.request.urlopen(req, timeout=5)
+            except Exception:
+                pass  # never let logging failures break the worker
 
-
-def _flush_loop():
-    """Background thread that flushes on interval."""
-    while not _stop.is_set():
-        _stop.wait(FLUSH_INTERVAL)
-        _flush()
-
-
-def main():
-    if not URL:
-        # No receiver configured — just pass stdin through to stdout
-        for line in sys.stdin:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-        return
-
-    print(f"[log-forwarder] started: url={URL} endpoint={ENDPOINT_ID} worker={WORKER_ID}", file=sys.stderr, flush=True)
-
-    # Start background flush thread
-    t = threading.Thread(target=_flush_loop, daemon=True)
-    t.start()
-
-    try:
-        for line in sys.stdin:
-            # Always echo to stdout (RunPod captures stdout for its own logs)
-            sys.stdout.write(line)
-            sys.stdout.flush()
-
-            stripped = line.rstrip("\n")
-            with _lock:
-                _buffer.append(stripped)
-                should_flush = len(_buffer) >= BATCH_SIZE
-            if should_flush:
-                _flush()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        _stop.set()
-        _flush()  # Final flush
+    def with_tags(self, **tags: str) -> AvivLogger:
+        """Return a new logger with additional tags merged in."""
+        merged = {**self.tags, **tags}
+        child = AvivLogger(source=self.source, tags=merged,
+                           flush_interval=self._flush_interval)
+        # Share the parent's buffer and token state
+        child._enabled = self._enabled
+        child._token = self._token
+        child._url = self._url
+        return child
 
 
-if __name__ == "__main__":
-    main()
+# Module-level default logger instance
+_default_tags = {}
+_endpoint_id = os.environ.get("RUNPOD_ENDPOINT_ID", os.environ.get("RUNPOD_DC_ID", ""))
+_worker_id = os.environ.get("RUNPOD_POD_ID", os.environ.get("HOSTNAME", ""))
+if _endpoint_id:
+    _default_tags["endpoint"] = _endpoint_id
+if _worker_id:
+    _default_tags["worker"] = _worker_id
+
+log = AvivLogger(source=SOURCE, tags=_default_tags)
