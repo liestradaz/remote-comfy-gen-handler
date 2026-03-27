@@ -31,7 +31,9 @@ class AvivLogger:
                  flush_interval: float = 5.0):
         self.source = source
         self.tags = tags or {}
-        self._url = _LOGGER_URL.rstrip("/") + "/ingest"
+        # Don't append /ingest if the URL already ends with it
+        base = _LOGGER_URL.rstrip("/")
+        self._url = base if base.endswith("/ingest") else base + "/ingest"
         self._token = _LOGGER_TOKEN
         self._enabled = bool(self._token)
         self._buffer: list[tuple[str, str]] = []  # (level, line)
