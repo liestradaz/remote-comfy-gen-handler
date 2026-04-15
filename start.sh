@@ -8,6 +8,22 @@ COMFY_LOG="/tmp/comfyui_startup.log"
 
 echo "[start] Booting ComfyUI from $COMFYUI_DIR (baked in image)..."
 
+# Pre-install Impact Pack / Subpack Python deps so they're available when
+# the node_installer downloads and restarts ComfyUI mid-job.
+echo "[start] Pre-installing Impact Pack dependencies..."
+pip install -q \
+    segment-anything \
+    scikit-image \
+    piexif \
+    "ultralytics>=8.3.162" \
+    scipy \
+    dill \
+    matplotlib \
+    opencv-python-headless \
+    "git+https://github.com/facebookresearch/sam2" \
+    2>&1 | tail -3 || echo "[start] WARNING: some Impact Pack deps failed to install"
+echo "[start] Impact Pack dependencies installed"
+
 # Verify ComfyUI exists
 if [ ! -f "$COMFYUI_DIR/main.py" ]; then
     echo "[start] ERROR: ComfyUI not found at $COMFYUI_DIR"
