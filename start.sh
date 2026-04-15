@@ -20,7 +20,6 @@ pip install -q \
     dill \
     matplotlib \
     opencv-python-headless \
-    sam2 \
     2>&1 | tail -3 || echo "[start] WARNING: some Impact Pack deps failed to install"
 echo "[start] Impact Pack dependencies installed"
 
