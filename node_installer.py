@@ -253,18 +253,21 @@ def install_repo(repo_url: str, force_deps: bool = False) -> bool:
     return True
 
 
+COMFY_RESTART_LOG = "/tmp/comfyui_restart.log"
+
+
 def restart_comfyui() -> bool:
     """Kill ComfyUI and restart it fresh. Wait until ready."""
     print("[node_installer] Restarting ComfyUI...", flush=True)
 
     # Find and kill ComfyUI process
-    result = subprocess.run(
+    subprocess.run(
         ["pkill", "-f", "python3 main.py"],
         capture_output=True, text=True,
     )
     time.sleep(2)
 
-    # Start ComfyUI in background
+    # Start ComfyUI in background, capturing logs so we can detect import failures
     comfy_port = os.environ.get("COMFYUI_PORT", "8188")
     cmd = [
         "python3", "main.py",
@@ -276,12 +279,14 @@ def restart_comfyui() -> bool:
     extra_paths = os.path.join(COMFYUI_DIR, "extra_model_paths.yaml")
     if os.path.exists(extra_paths):
         cmd += ["--extra-model-paths-config", extra_paths]
-    subprocess.Popen(
-        cmd,
-        cwd=COMFYUI_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+
+    with open(COMFY_RESTART_LOG, "w") as log_f:
+        subprocess.Popen(
+            cmd,
+            cwd=COMFYUI_DIR,
+            stdout=log_f,
+            stderr=log_f,
+        )
 
     # Wait for ready
     max_wait = 120
@@ -298,6 +303,52 @@ def restart_comfyui() -> bool:
 
     print(f"[node_installer] ERROR: ComfyUI failed to restart within {max_wait}s", flush=True)
     return False
+
+
+def fix_import_failures() -> bool:
+    """Scan ComfyUI restart log for IMPORT FAILED nodes and reinstall their deps.
+
+    Returns True if any deps were reinstalled (caller should restart ComfyUI again).
+    """
+    if not os.path.exists(COMFY_RESTART_LOG):
+        return False
+
+    with open(COMFY_RESTART_LOG) as f:
+        log = f.read()
+
+    # ComfyUI logs: "IMPORT FAILED: /ComfyUI/custom_nodes/ComfyUI-Impact-Pack"
+    import re as _re
+    failed_paths = _re.findall(r"IMPORT FAILED[:\s]+([^\n]+custom_nodes/[^\s\"]+)", log)
+    if not failed_paths:
+        return False
+
+    fixed_any = False
+    for path in failed_paths:
+        node_dir = path.strip().rstrip("/")
+        node_name = os.path.basename(node_dir)
+        print(f"[node_installer] Import failed for {node_name}, reinstalling deps...", flush=True)
+
+        req_file = os.path.join(node_dir, "requirements.txt")
+        if os.path.exists(req_file):
+            result = subprocess.run(
+                ["pip", "install", "-q", "-r", req_file],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                print(f"[node_installer] Deps reinstalled for {node_name}", flush=True)
+                fixed_any = True
+            else:
+                print(f"[node_installer] WARNING: dep install failed for {node_name}: {result.stderr[:300]}", flush=True)
+
+        install_script = os.path.join(node_dir, "install.py")
+        if os.path.exists(install_script):
+            subprocess.run(
+                ["python3", install_script],
+                capture_output=True, text=True, timeout=120,
+                cwd=node_dir,
+            )
+
+    return fixed_any
 
 
 def parse_missing_node_from_error(error_msg: str) -> str | None:
@@ -393,5 +444,12 @@ def ensure_nodes(workflow: dict, max_retries: int = 3, progress_fn=None) -> list
         _progress(f"Restarting ComfyUI after installing {len(installed_repos)} node(s)")
         if not restart_comfyui():
             raise RuntimeError("Failed to restart ComfyUI after installing nodes")
+
+        # Check if any nodes failed to import (missing Python deps) and fix them
+        if fix_import_failures():
+            print("[node_installer] Fixed import failures — restarting ComfyUI again...", flush=True)
+            _progress("Fixing node import errors, restarting ComfyUI")
+            if not restart_comfyui():
+                raise RuntimeError("Failed to restart ComfyUI after fixing import failures")
 
     return installed_repos
