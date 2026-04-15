@@ -86,16 +86,32 @@ MODEL_DIRS = [
 
 
 def _resolve_model_path(filename: str) -> str | None:
-    """Find a .safetensors file on the volume by walking model dirs."""
+    """Find a model file on the volume by walking model dirs.
+
+    Handles filenames with subfolder prefixes (e.g. 'bbox/Nipples.pt'):
+    first tries a direct path join under each base, then falls back to
+    walking and matching by relative path suffix or bare filename.
+    """
+    bare_name = os.path.basename(filename)
+    subdir = os.path.dirname(filename)
     for base in MODEL_DIRS:
         if not os.path.isdir(base):
             continue
+        # Direct walk: match full relative path (e.g. ultralytics/bbox/Nipples.pt)
         for root, _dirs, files in os.walk(base):
-            if filename in files:
-                path = os.path.join(root, filename)
-                # Verify the file actually exists (catches broken symlinks)
+            if bare_name in files:
+                path = os.path.join(root, bare_name)
                 if os.path.isfile(path):
-                    return path
+                    # If filename has a subdir prefix, verify the path ends with it
+                    if not subdir or path.replace("\\", "/").endswith(f"{subdir}/{bare_name}"):
+                        return path
+        # Fallback: match by bare filename anywhere under base
+        if subdir:
+            for root, _dirs, files in os.walk(base):
+                if bare_name in files:
+                    path = os.path.join(root, bare_name)
+                    if os.path.isfile(path):
+                        return path
     return None
 
 
