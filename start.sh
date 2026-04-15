@@ -20,7 +20,7 @@ pip install -q \
     dill \
     matplotlib \
     opencv-python-headless \
-    "git+https://github.com/facebookresearch/sam2" \
+    sam2 \
     2>&1 | tail -3 || echo "[start] WARNING: some Impact Pack deps failed to install"
 echo "[start] Impact Pack dependencies installed"
 
